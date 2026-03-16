@@ -1,0 +1,82 @@
+#!/bin/bash
+# mesh_mpirun — Launch MPI processes using libmesh-mpi
+# Usage: mesh_mpirun -np 4 -hosts spark-a,spark-b,spark-c,spark-d [command...]
+
+NP=0
+HOSTS=""
+shift_count=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -np) NP=$2; shift 2 ;;
+        -hosts) HOSTS=$2; shift 2 ;;
+        *) break ;;
+    esac
+done
+
+if [ "$NP" -eq 0 ] || [ -z "$HOSTS" ]; then
+    echo "Usage: mesh_mpirun -np N -hosts host1,host2,... command..."
+    exit 1
+fi
+
+# Parse hosts
+IFS=',' read -ra HOST_LIST <<< "$HOSTS"
+CTRL_IP=$(getent hosts ${HOST_LIST[0]} | awk '{print $1}')
+CTRL_ADDR="${CTRL_IP}:19900"
+
+echo "[mesh_mpirun] Launching $NP processes on ${#HOST_LIST[@]} hosts"
+echo "[mesh_mpirun] Control: $CTRL_ADDR"
+
+# SSH user mapping
+declare -A USERS
+USERS[spark-a]="titanic"
+USERS[spark-b]="iceberg"
+USERS[spark-c]="carpathia"
+USERS[spark-d]="water"
+USERS[10.0.0.170]="titanic"
+USERS[10.0.0.171]="iceberg"
+USERS[10.0.0.172]="carpathia"
+USERS[10.0.0.173]="water"
+
+PIDS=()
+CMD="$@"
+
+for ((rank=0; rank<NP; rank++)); do
+    host=${HOST_LIST[$rank]}
+    user=${USERS[$host]:-titanic}
+
+    ENV="export MESH_MPI_RANK=$rank; \
+         export MESH_MPI_SIZE=$NP; \
+         export MESH_MPI_CTRL_ADDR=$CTRL_ADDR; \
+         export MESH_MPI_MGMT_IF=enP7s7; \
+         export LD_LIBRARY_PATH=/home/titanic/libmesh-rdma/mpi:/home/titanic/libmesh-rdma:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH; \
+         export PYTHONPATH=/home/titanic/warpx/build/lib/site-packages:\$PYTHONPATH; \
+         export PATH=/home/titanic/warpx-env/bin:/usr/local/cuda/bin:/usr/bin:/bin:\$PATH"
+
+    if [ "$host" = "$(hostname -s)" ] || [ "$host" = "$(hostname)" ]; then
+        # Local
+        echo "[mesh_mpirun] rank $rank: local ($host)"
+        bash -c "$ENV; $CMD" &
+        PIDS+=($!)
+    else
+        # Remote
+        echo "[mesh_mpirun] rank $rank: $user@$host"
+        ssh -o StrictHostKeyChecking=no ${user}@${host} "bash -c '$ENV; $CMD'" &
+        PIDS+=($!)
+    fi
+done
+
+echo "[mesh_mpirun] All $NP processes launched. Waiting..."
+
+# Wait for all, capture exit codes
+FAIL=0
+for pid in "${PIDS[@]}"; do
+    wait $pid || FAIL=1
+done
+
+if [ $FAIL -eq 0 ]; then
+    echo "[mesh_mpirun] All processes completed successfully."
+else
+    echo "[mesh_mpirun] Some processes failed."
+    exit 1
+fi

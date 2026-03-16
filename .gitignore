@@ -1,0 +1,15 @@
+*.o
+*.so
+*.a
+*.ko
+*.d
+*.pyc
+__pycache__/
+build/
+.cache/
+*.swp
+*~
+*.working_with_debug
+*.clean_no_debug
+tests/test_bandwidth
+tests/test_pingpong
