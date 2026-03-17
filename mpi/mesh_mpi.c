@@ -400,17 +400,89 @@ int mesh_mpi_bootstrap(void) {
                         continue;
                     }
                 } else {
-                    /* We connect — route TCP handshake via management network */
-                    peer_msg->nics[ri].handle.handshake_ip = peer_msg->mgmt_ip;
-                    if (mesh_rdma_connect(g_mpi.ctx, &peer_msg->nics[ri].handle,
-                                          &p->conn) != 0) {
-                        fprintf(stderr, "[mesh-mpi] rank %d: connect to rank %d failed\n",
+                    /* We connect — create QP on our known-correct NIC
+                     * (NOT mesh_rdma_connect which re-selects NIC internally
+                     * and may pick the wrong one if netmasks differ from /24) */
+                    mesh_rdma_nic_t *local_nic = mesh_rdma_get_nic(g_mpi.ctx, p->nic_idx);
+                    struct ibv_qp *qp;
+                    struct ibv_cq *cq;
+                    if (mesh_rdma_create_qp(local_nic, &qp, &cq) != 0) {
+                        fprintf(stderr, "[mesh-mpi] rank %d: QP create for rank %d failed\n",
                                 g_mpi.rank, peer);
                         continue;
                     }
+
+                    /* Prepare local QP info using our NIC */
+                    mesh_rdma_qp_info_t local_info, remote_info;
+                    memset(&local_info, 0, sizeof(local_info));
+                    local_info.qp_num = htonl(qp->qp_num);
+                    local_info.psn = htonl(0);
+                    memcpy(local_info.gid, &local_nic->gid, 16);
+                    local_info.gid_index = local_nic->gid_index;
+                    local_info.mtu = local_nic->active_mtu;
+
+                    /* TCP handshake via management network */
+                    uint32_t hs_ip = peer_msg->mgmt_ip;
+                    uint16_t hs_port = peer_msg->nics[ri].handle.handshake_port;
+                    fprintf(stderr, "[mesh-mpi] rank %d: connect to rank %d — "
+                            "local NIC %d (%s), QP %u, handshake via %d.%d.%d.%d:%d\n",
+                            g_mpi.rank, peer, p->nic_idx, local_nic->rdma_name,
+                            qp->qp_num,
+                            (hs_ip >> 24) & 0xFF, (hs_ip >> 16) & 0xFF,
+                            (hs_ip >> 8) & 0xFF, hs_ip & 0xFF, hs_port);
+
+                    if (mesh_rdma_send_handshake(hs_ip, hs_port,
+                                                  &local_info, &remote_info) != 0) {
+                        fprintf(stderr, "[mesh-mpi] rank %d: handshake to rank %d failed\n",
+                                g_mpi.rank, peer);
+                        ibv_destroy_qp(qp);
+                        ibv_destroy_cq(cq);
+                        continue;
+                    }
+
+                    /* Connect QP: INIT → RTR → RTS */
+                    if (mesh_rdma_connect_qp(qp, local_nic, &remote_info) != 0) {
+                        fprintf(stderr, "[mesh-mpi] rank %d: QP connect to rank %d failed\n",
+                                g_mpi.rank, peer);
+                        ibv_destroy_qp(qp);
+                        ibv_destroy_cq(cq);
+                        continue;
+                    }
+
+                    /* Verify RTS */
+                    {
+                        struct ibv_qp_attr qchk;
+                        struct ibv_qp_init_attr qi;
+                        memset(&qchk, 0, sizeof(qchk));
+                        if (ibv_query_qp(qp, &qchk, IBV_QP_STATE, &qi) == 0 &&
+                            qchk.qp_state != IBV_QPS_RTS) {
+                            fprintf(stderr, "[mesh-mpi] rank %d: QP to rank %d NOT RTS (state=%d)\n",
+                                    g_mpi.rank, peer, qchk.qp_state);
+                            ibv_destroy_qp(qp);
+                            ibv_destroy_cq(cq);
+                            continue;
+                        }
+                    }
+
+                    /* Build connection object */
+                    mesh_rdma_conn_t *conn = calloc(1, sizeof(*conn));
+                    conn->nic = local_nic;
+                    conn->qp = qp;
+                    conn->cq = cq;
+                    conn->remote_qp_num = ntohl(remote_info.qp_num);
+                    memcpy(&conn->remote_gid, remote_info.gid, 16);
+                    conn->connected = 1;
+                    p->conn = conn;
+
+                    fprintf(stderr, "[mesh-mpi] rank %d: connected to rank %d "
+                            "(local QP %u on NIC %s, remote QP %u)\n",
+                            g_mpi.rank, peer, qp->qp_num, local_nic->rdma_name,
+                            conn->remote_qp_num);
                 }
 
-                /* Register send/recv buffers */
+                /* Register send/recv buffers on the SAME NIC as the connection's QP.
+                 * Derive nic_idx from the connection to guarantee PD match. */
+                p->nic_idx = (int)(p->conn->nic - g_mpi.ctx->nics);
                 int num_slots = 16;
                 size_t slot_size = 4 * 1024 * 1024;
                 size_t pool_size = num_slots * slot_size;
@@ -422,19 +494,26 @@ int mesh_mpi_bootstrap(void) {
                 }
                 if (mesh_rdma_reg_mr(g_mpi.ctx, p->nic_idx, p->send_pool,
                                      pool_size, &p->send_mr) != 0) {
-                    fprintf(stderr, "[mesh-mpi] rank %d: send MR reg failed\n", g_mpi.rank);
+                    fprintf(stderr, "[mesh-mpi] rank %d: send MR reg failed (nic=%d)\n",
+                            g_mpi.rank, p->nic_idx);
                     continue;
                 }
                 if (mesh_rdma_reg_mr(g_mpi.ctx, p->nic_idx, p->recv_pool,
                                      pool_size, &p->recv_mr) != 0) {
-                    fprintf(stderr, "[mesh-mpi] rank %d: recv MR reg failed\n", g_mpi.rank);
+                    fprintf(stderr, "[mesh-mpi] rank %d: recv MR reg failed (nic=%d)\n",
+                            g_mpi.rank, p->nic_idx);
                     continue;
                 }
                 for (int r = 0; r < num_slots; r++) {
-                    mesh_rdma_post_recv(p->conn,
+                    int rc = mesh_rdma_post_recv(p->conn,
                                         p->recv_pool + r * slot_size,
                                         slot_size,
                                         p->recv_mr->mr->lkey, r);
+                    if (rc != 0) {
+                        fprintf(stderr, "[mesh-mpi] rank %d: post_recv slot %d failed "
+                                "(rc=%d, nic=%d, lkey=0x%x) — PD mismatch?\n",
+                                g_mpi.rank, r, rc, p->nic_idx, p->recv_mr->mr->lkey);
+                    }
                 }
                 fprintf(stderr, "[mesh-mpi] rank %d: buffers registered (%d x %zu)\n",
                         g_mpi.rank, num_slots, slot_size);
