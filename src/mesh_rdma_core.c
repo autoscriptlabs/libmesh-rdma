@@ -759,6 +759,22 @@ int mesh_rdma_connect(mesh_rdma_ctx_t *ctx,
         return -1;
     }
 
+    /* Verify QP reached RTS state */
+    {
+        struct ibv_qp_attr qp_check;
+        struct ibv_qp_init_attr qp_init_check;
+        memset(&qp_check, 0, sizeof(qp_check));
+        if (ibv_query_qp(qp, &qp_check, IBV_QP_STATE, &qp_init_check) == 0) {
+            if (qp_check.qp_state != IBV_QPS_RTS) {
+                fprintf(stderr, "[mesh-rdma] CONNECT: QP %u NOT in RTS (state=%d), expected RTS=%d\n",
+                        qp->qp_num, qp_check.qp_state, IBV_QPS_RTS);
+                ibv_destroy_qp(qp);
+                ibv_destroy_cq(cq);
+                return -1;
+            }
+        }
+    }
+
     /* Build connection */
     mesh_rdma_conn_t *conn = calloc(1, sizeof(*conn));
     conn->nic = nic;
@@ -769,7 +785,7 @@ int mesh_rdma_connect(mesh_rdma_ctx_t *ctx,
     conn->connected = 1;
 
     *conn_out = conn;
-    LOG_INFO(ctx, "Connected to remote QP %d", conn->remote_qp_num);
+    LOG_INFO(ctx, "Connected to remote QP %d (verified RTS)", conn->remote_qp_num);
     return 0;
 }
 
@@ -801,10 +817,33 @@ int mesh_rdma_accept(mesh_rdma_ctx_t *ctx,
         return -1;
     }
 
+    fprintf(stderr, "[mesh-rdma] ACCEPT: local QP %u on NIC %s (PD=%p), "
+            "remote QP %u, remote GID %02x%02x:...:%02x%02x\n",
+            lctx->qp->qp_num, lctx->nic->rdma_name, (void *)lctx->nic->pd,
+            ntohl(remote_info.qp_num),
+            remote_info.gid[0], remote_info.gid[1],
+            remote_info.gid[14], remote_info.gid[15]);
+
     /* Connect QP */
     if (mesh_rdma_connect_qp(lctx->qp, lctx->nic, &remote_info) != 0) {
         LOG_ERR(ctx, "QP connect on accept failed");
         return -1;
+    }
+
+    /* Verify QP reached RTS state */
+    {
+        struct ibv_qp_attr qp_check;
+        struct ibv_qp_init_attr qp_init_check;
+        memset(&qp_check, 0, sizeof(qp_check));
+        if (ibv_query_qp(lctx->qp, &qp_check, IBV_QP_STATE, &qp_init_check) == 0) {
+            if (qp_check.qp_state != IBV_QPS_RTS) {
+                fprintf(stderr, "[mesh-rdma] ACCEPT: QP %u NOT in RTS (state=%d), expected RTS=%d\n",
+                        lctx->qp->qp_num, qp_check.qp_state, IBV_QPS_RTS);
+                return -1;
+            }
+            fprintf(stderr, "[mesh-rdma] ACCEPT: QP %u verified in RTS state\n",
+                    lctx->qp->qp_num);
+        }
     }
 
     /* Build connection */
@@ -817,7 +856,7 @@ int mesh_rdma_accept(mesh_rdma_ctx_t *ctx,
     conn->connected = 1;
 
     *conn_out = conn;
-    LOG_INFO(ctx, "Accepted connection from QP %d", conn->remote_qp_num);
+    LOG_INFO(ctx, "Accepted connection from QP %d (verified RTS)", conn->remote_qp_num);
     return 0;
 }
 

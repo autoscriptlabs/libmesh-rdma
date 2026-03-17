@@ -165,7 +165,13 @@ int mesh_mpi_recv_raw(int src, void *buf, size_t len,
             struct ibv_wc wc;
             memset(&wc, 0, sizeof(wc));
             int r = ibv_poll_cq(peer->conn->cq, 1, &wc);
-            if (wc.status != IBV_WC_SUCCESS) continue;
+            if (r <= 0) continue; /* no completion or CQ error */
+
+            if (wc.status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "[mesh-mpi] rank %d: WC error from peer %d: %s (opcode=%d)\n",
+                        g_mpi.rank, p, ibv_wc_status_str(wc.status), wc.opcode);
+                continue;
+            }
 
             if (!(wc.opcode & IBV_WC_RECV)) {
                 /* Send completion — ignore here */
@@ -376,7 +382,13 @@ int mesh_mpi_progress(void) {
         struct ibv_wc wc;
         memset(&wc, 0, sizeof(wc));
         int r = ibv_poll_cq(peer->conn->cq, 1, &wc);
-        if (wc.status != IBV_WC_SUCCESS) continue;
+        if (r <= 0) continue; /* no completion or CQ error */
+
+        if (wc.status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "[mesh-mpi] rank %d: progress WC error from peer %d: %s (opcode=%d)\n",
+                    g_mpi.rank, p, ibv_wc_status_str(wc.status), wc.opcode);
+            continue;
+        }
         if (!(wc.opcode & IBV_WC_RECV)) continue;
 
         progressed++;

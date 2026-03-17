@@ -73,16 +73,17 @@ int MPI_Barrier(MPI_Comm comm) {
 
     if (size <= 1) return MPI_SUCCESS;
 
-    /* Ring barrier: token passes around ring twice */
+    /* Ring barrier: token passes counter-clockwise (send to prev, recv from next).
+     * This ensures all links use the working direction on direct-connect rings
+     * where the clockwise return path (e.g. 3→0) may be broken. */
     int next = (rank + 1) % size;
     int prev = (rank - 1 + size) % size;
-    /* Phase 1: gather to rank 0 */
     if (rank != 0) {
-        MPI_Recv(&token, 1, MPI_BYTE, prev, 0xFFFF, comm, MPI_STATUS_IGNORE);
-        MPI_Send(&token, 1, MPI_BYTE, next, 0xFFFF, comm);
+        MPI_Recv(&token, 1, MPI_BYTE, next, 0xFFFF, comm, MPI_STATUS_IGNORE);
+        MPI_Send(&token, 1, MPI_BYTE, prev, 0xFFFF, comm);
     } else {
-        MPI_Send(&token, 1, MPI_BYTE, next, 0xFFFF, comm);
-        MPI_Recv(&token, 1, MPI_BYTE, prev, 0xFFFF, comm, MPI_STATUS_IGNORE);
+        MPI_Send(&token, 1, MPI_BYTE, prev, 0xFFFF, comm);
+        MPI_Recv(&token, 1, MPI_BYTE, next, 0xFFFF, comm, MPI_STATUS_IGNORE);
     }
     return MPI_SUCCESS;
 }
@@ -158,24 +159,25 @@ int MPI_Reduce(const void *sendbuf, void *recvbuf, int count,
     }
 
     fprintf(stderr, "[mesh-mpi] rank %d: ENTER Reduce root=%d\n", rank, root); fflush(stderr);
-    /* Chain reduce: prev -> rank -> next, accumulating toward root */
+    /* Chain reduce: counter-clockwise (recv from next, send to prev) toward root.
+     * This matches Gather/Bcast direction and avoids the broken clockwise return path. */
     int prev = (rank - 1 + size) % size;
     int next = (rank + 1) % size;
 
     if (sendbuf != MPI_IN_PLACE)
         memcpy(recvbuf, sendbuf, len);
 
-    /* Everyone except the rank "after root" (first in chain) receives from prev */
+    /* Everyone except the rank whose next==root (start of chain) receives from next */
     void *tmp = malloc(len);
-    if (prev != root) {
-        /* We have a predecessor in the chain — recv and accumulate */
-        MPI_Recv(tmp, count, datatype, prev, 0xFFFC, comm, MPI_STATUS_IGNORE);
+    if (next != root) {
+        /* We have a successor in the chain — recv and accumulate */
+        MPI_Recv(tmp, count, datatype, next, 0xFFFC, comm, MPI_STATUS_IGNORE);
         apply_op(recvbuf, tmp, count, datatype, op);
     }
 
-    /* Everyone except root sends to next */
+    /* Everyone except root sends to prev */
     if (rank != root) {
-        MPI_Send(recvbuf, count, datatype, next, 0xFFFC, comm);
+        MPI_Send(recvbuf, count, datatype, prev, 0xFFFC, comm);
     }
     free(tmp);
 
@@ -357,18 +359,18 @@ int MPI_Alltoall(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
     memcpy((char *)recvbuf + rank * recv_chunk,
            (const char *)sendbuf + rank * send_chunk, send_chunk);
 
-    /* Ring-based alltoall: shift data around ring */
+    /* Ring-based alltoall: shift data counter-clockwise (send to prev, recv from next).
+     * This avoids the broken clockwise return path on direct-connect rings. */
     int next = (rank + 1) % size;
     int prev = (rank - 1 + size) % size;
-    /* Each step: send one chunk to next, recv one chunk from prev */
     for (int step = 1; step < size; step++) {
-        int send_idx = (rank + step) % size;
-        int recv_idx = (rank - step + size) % size;
+        int send_idx = (rank - step + size) % size;
+        int recv_idx = (rank + step) % size;
         MPI_Request sreq;
         MPI_Isend((const char *)sendbuf + send_idx * send_chunk,
-                  sendcount, sendtype, next, 0xFFF9 + step, comm, &sreq);
+                  sendcount, sendtype, prev, 0xFFF9 + step, comm, &sreq);
         MPI_Recv((char *)recvbuf + recv_idx * recv_chunk,
-                 recvcount, recvtype, prev, 0xFFF9 + step, comm, MPI_STATUS_IGNORE);
+                 recvcount, recvtype, next, 0xFFF9 + step, comm, MPI_STATUS_IGNORE);
         MPI_Wait(&sreq, MPI_STATUS_IGNORE);
     }
     return MPI_SUCCESS;
