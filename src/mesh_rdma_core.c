@@ -139,38 +139,15 @@ uint32_t mesh_rdma_gid_to_ipv4(const union ibv_gid *gid) {
            ((uint32_t)gid->raw[15]);
 }
 
-/*
- * Read GID type from sysfs. Returns:
- *   1 = RoCE v2 (what we want — UDP/IP encapsulation)
- *   0 = IB/RoCE v1 (raw Ethernet, wrong encapsulation for switchless)
- *  -1 = unknown / error
- */
-static int query_gid_type(const char *rdma_name, int port_num, int gid_index) {
-    char path[256], buf[64];
-    snprintf(path, sizeof(path),
-             "/sys/class/infiniband/%s/ports/%d/gid_attrs/types/%d",
-             rdma_name, port_num, gid_index);
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return -1; }
-    fclose(f);
-    /* sysfs shows "RoCE v2", "IB/RoCE v1", or "RoCE v1" */
-    if (strstr(buf, "v2")) return 1;
-    return 0;
-}
-
 int mesh_rdma_find_ipv4_gid_index(struct ibv_context *context,
                                    int port_num,
                                    uint32_t expected_ip) {
     union ibv_gid gid;
-    int best_v2_any = -1;   /* Any RoCEv2 IPv4-mapped GID (wrong IP) */
-    int best_any = -1;      /* Fallback: any IPv4-mapped GID (v1) */
+    int best_index = -1;
     struct ibv_port_attr port_attr;
 
     if (!context) return -1;
     if (ibv_query_port(context, port_num, &port_attr) != 0) return -1;
-
-    const char *dev_name = ibv_get_device_name(context->device);
 
     int max_gids = port_attr.gid_tbl_len;
     if (max_gids > 16) max_gids = 16;
@@ -185,40 +162,17 @@ int mesh_rdma_find_ipv4_gid_index(struct ibv_context *context,
         }
         if (all_zero) continue;
 
-        if (!mesh_rdma_gid_is_ipv4_mapped(&gid)) continue;
-
-        uint32_t gid_ip = mesh_rdma_gid_to_ipv4(&gid);
-        int is_v2 = query_gid_type(dev_name, port_num, i);
-
-        if (expected_ip != 0 && gid_ip == expected_ip && is_v2 == 1) {
-            /* Perfect: right IP + RoCEv2 */
-            fprintf(stderr, "[mesh-rdma] GID index %d: IP match + RoCE v2 ✓ (dev=%s)\n",
-                    i, dev_name);
-            return i;
-        }
-
-        /* Track fallback candidates in priority order */
-        if (is_v2 == 1 && best_v2_any < 0)
-            best_v2_any = i;
-        else if (best_any < 0)
-            best_any = i;
-    }
-
-    /* Prefer RoCEv2 over v1 in all fallback cases */
-    int result = (best_v2_any >= 0) ? best_v2_any : best_any;
-
-    if (result >= 0) {
-        int is_v2 = query_gid_type(dev_name, port_num, result);
-        fprintf(stderr, "[mesh-rdma] GID index %d selected (dev=%s, RoCE %s, %s IP match)\n",
-                result, dev_name, is_v2 == 1 ? "v2" : "v1",
-                expected_ip != 0 ? "with" : "no");
-        if (is_v2 != 1) {
-            fprintf(stderr, "[mesh-rdma] WARNING: no RoCE v2 GID found for %s — "
-                    "connection will likely fail on switchless links\n", dev_name);
+        if (mesh_rdma_gid_is_ipv4_mapped(&gid)) {
+            uint32_t gid_ip = mesh_rdma_gid_to_ipv4(&gid);
+            if (expected_ip != 0 && gid_ip == expected_ip) {
+                return i;
+            }
+            if (best_index < 0) {
+                best_index = i;
+            }
         }
     }
-
-    return result;
+    return best_index;
 }
 
 /* ============================================================
