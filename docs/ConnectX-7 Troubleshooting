@@ -1,0 +1,212 @@
+# ConnectX-7 Direct-Connect Troubleshooting Guide
+
+## For DGX Spark and other consumer/prosumer GPU systems with Mellanox ConnectX-7 NICs
+
+This document covers every gotcha we hit bringing up a 4-node ring topology with direct-attach copper cables. If you're building a switchless GPU cluster with ConnectX-7 NICs, read this first. It will save you days.
+
+---
+
+## 1. Port Mapping: Which Physical Port Is Which?
+
+**The Problem:** ConnectX-7 is a dual-port NIC. Each physical port exposes as a separate network interface. The naming convention does NOT make the mapping obvious, and getting it wrong means your cable appears "connected" (link UP, speed negotiated) but zero data flows.
+
+**Interfaces you'll see:**
+
+| Interface | Description |
+|-----------|-------------|
+| `enp1s0f0np0` / `rocep1s0f0` | Card 1, physical port 0 |
+| `enp1s0f1np1` / `rocep1s0f1` | Card 1, physical port 1 |
+| `enP2p1s0f0np0` / `roceP2p1s0f0` | Card 2, physical port 0 |
+| `enP2p1s0f1np1` / `roceP2p1s0f1` | Card 2, physical port 1 |
+
+**How to identify which port your cable is in:**
+
+```bash
+# Check which port has carrier (cable connected)
+cat /sys/class/net/enP2p1s0f0np0/carrier  # 1 = cable present
+cat /sys/class/net/enP2p1s0f1np1/carrier  # 1 = cable present
+
+# Check physical port name
+cat /sys/class/net/enP2p1s0f0np0/phys_port_name  # p0
+cat /sys/class/net/enP2p1s0f1np1/phys_port_name  # p1
+
+# WARNING: dev_port lies on Mellanox — both ports may report 0
+cat /sys/class/net/enP2p1s0f0np0/dev_port  # Don't trust this
+```
+
+**The trap:** Link detection works on the wrong port. The NIC will negotiate 200Gbps and report `state UP` on a port that has no cable, because electrical signaling can leak between adjacent ports on the PCB. **Always verify with packet counters:**
+
+```bash
+# Send a ping, then check if TX increments on YOUR side
+# and RX increments on the REMOTE side
+cat /sys/class/net/<interface>/statistics/tx_packets
+ping -c 1 -I <your_ip> <remote_ip>
+cat /sys/class/net/<interface>/statistics/tx_packets
+# If TX didn't change, you're on the wrong interface
+```
+
+---
+
+## 2. GID Table: RoCEv1 vs RoCEv2
+
+**The Problem:** Each RDMA interface has a GID (Global Identifier) table with multiple entries. For IPv4-mapped addresses, you'll typically see the **same IP** at two different GID indices — one for RoCEv1 (IB-over-Ethernet framing) and one for RoCEv2 (UDP/IP encapsulation). Using the wrong one causes silent packet drops.
+
+**Example GID table on ConnectX-7:**
+
+```
+GID[0]: fe80::... (link-local, RoCEv1)
+GID[1]: fe80::... (link-local, RoCEv2)
+GID[2]: ::ffff:192.168.103.2 (IPv4-mapped, RoCEv1)  ← WRONG for switchless
+GID[3]: ::ffff:192.168.103.2 (IPv4-mapped, RoCEv2)  ← CORRECT
+```
+
+**Dump your GID table:**
+
+```bash
+for i in $(seq 0 7); do
+    gid=$(cat /sys/class/infiniband/roceP2p1s0f1/ports/1/gids/$i 2>/dev/null)
+    type=$(cat /sys/class/infiniband/roceP2p1s0f1/ports/1/gid_attrs/types/$i 2>/dev/null)
+    [ -n "$gid" ] && echo "GID[$i]: $gid  type=$type"
+done
+```
+
+**The fix:** Always scan for the **highest** IPv4-mapped GID index that matches your IP. On ConnectX-7, this is typically index 3 (RoCEv2). RoCEv1 works on switched networks but **fails on direct-connect** because there's no IB subnet manager to handle the v1 framing.
+
+**Environment variable override:**
+
+```bash
+export MESH_RDMA_GID_INDEX=3
+```
+
+---
+
+## 3. Firmware State After Reboot
+
+**The Problem:** After a node reboot, if you add IP addresses to RDMA interfaces using `ip addr add` (ephemeral config), the NIC firmware may enter a half-initialized state where:
+
+- Link detection reports UP at full speed (200Gbps)
+- ARP resolution works (MAC addresses are exchanged)
+- **Zero data frames traverse the cable**
+- `ibv_rc_pingpong` fails with "transport retry counter exceeded"
+- RDMA QPs connect and verify RTS state, but all sends fail
+
+**The fix:** Use **netplan** (or equivalent persistent network config) to configure RDMA interfaces. The driver needs to see the interface come up during boot, not after.
+
+```yaml
+# /etc/netplan/60-rdma-links.yaml
+network:
+  version: 2
+  ethernets:
+    enP2p1s0f0np0:  # Verify this is the correct port!
+      addresses:
+        - 192.168.103.2/24
+      mtu: 9000
+```
+
+```bash
+sudo chmod 600 /etc/netplan/60-rdma-links.yaml
+sudo netplan apply
+```
+
+If you suspect firmware state issues, **reboot the node**. Bouncing the interface (`ip link set down/up`) is NOT sufficient.
+
+---
+
+## 4. MTU Mismatch
+
+**The Problem:** Direct-connect RDMA requires matching MTU on both ends. The RDMA path MTU is negotiated during QP setup, but if the Ethernet MTU is lower than what the RDMA layer requests, packets get silently dropped.
+
+**Default Ethernet MTU is 1500.** RDMA on ConnectX-7 wants 4096 (path_mtu=5). You need jumbo frames.
+
+**Set MTU on ALL RDMA interfaces:**
+
+```bash
+sudo ip link set enP2p1s0f0np0 mtu 9000
+```
+
+Or in netplan:
+
+```yaml
+    enP2p1s0f0np0:
+      mtu: 9000
+```
+
+**Verify both sides match:**
+
+```bash
+ip link show enP2p1s0f0np0 | grep mtu
+ssh remote "ip link show enP2p1s0f0np0 | grep mtu"
+```
+
+---
+
+## 5. ARP and RoCE Address Resolution
+
+**The Problem:** RoCE (RDMA over Converged Ethernet) needs to resolve GIDs to MAC addresses. On RoCEv2, the ConnectX firmware uses the kernel's ARP/neighbor table for this resolution. If ARP fails (common on direct-connect links where the kernel IP stack has routing issues), the firmware cannot build Ethernet frames.
+
+**Symptoms:**
+
+- `ibv_modify_qp` RTR transition fails with `errno=110 (Connection timed out)`
+- Ping between RDMA interfaces shows 100% packet loss
+- ARP entries show `(incomplete)` or `FAILED`
+
+**Workaround:** Add static ARP entries:
+
+```bash
+# On node A:
+sudo arp -s 192.168.103.1 <remote_mac> -i enP2p1s0f0np0
+
+# On node B:
+sudo arp -s 192.168.103.2 <local_mac> -i enP2p1s0f0np0
+```
+
+**Get MAC addresses:**
+
+```bash
+ip link show enP2p1s0f0np0 | grep ether
+```
+
+**Note:** Static ARP entries don't survive reboots. Add them to a startup script or use netplan's `routes`/`neighbors` config.
+
+---
+
+## 6. TCP Handshake Routing for Cross-Subnet Links
+
+**The Problem:** RDMA QP setup requires a TCP handshake to exchange QP numbers, PSN, and GID information. On a direct-connect ring, some links connect interfaces on different subnets (e.g., 192.168.103.x). If the kernel can't route TCP between these subnets (and it usually can't on direct-connect), the handshake fails.
+
+**The fix:** Route the TCP handshake through the management network (10GbE) while keeping the RDMA data path on the direct-connect interfaces. libmesh-rdma supports this via the `handshake_ip` override in `mesh_rdma_handle_t`.
+
+---
+
+## 7. Quick Diagnostic Checklist
+
+When an RDMA link doesn't work:
+
+1. **Verify port mapping:** Is the IP on the interface where the cable is physically plugged in?
+2. **Check link state:** `ip link show <iface>` — is it `UP,LOWER_UP`?
+3. **Check MTU:** Both sides must be 9000
+4. **Test L2 connectivity:** Check TX/RX packet counters during ping
+5. **Check GID index:** Use sysfs to verify RoCEv2 (not v1)
+6. **Check ARP:** `ip neigh show dev <iface>` — is it REACHABLE or FAILED?
+7. **Test RDMA directly:** `ibv_rc_pingpong -d <rdma_dev> -g 3 -p 19876`
+8. **If all else fails:** Reboot both nodes with persistent netplan config
+
+---
+
+## 8. Why NCCL Works When Your Code Doesn't
+
+NVIDIA's NCCL and its transport plugins handle all of the above internally:
+
+- They enumerate ports correctly and test connectivity before selecting
+- They force RoCEv2 GID selection
+- They pre-resolve addresses through the driver, bypassing kernel ARP
+- They have dual-path routing that works around broken links automatically
+- They retry with exponential backoff and multiple QP creation strategies
+
+This is not documentation NVIDIA publishes. We reverse-engineered it by comparing working NCCL connections against our failing ones, field-by-field, over several days.
+
+Open standards shouldn't require proprietary knowledge to function correctly.
+
+---
+
+*This document is part of the [libmesh-rdma](https://github.com/autoscriptlabs/libmesh-rdma) project — open-source RDMA transport for GPU clusters without proprietary switches.*
